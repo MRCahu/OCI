@@ -1,0 +1,426 @@
+import os
+import sqlite3
+import time
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+# =========================
+# Configuração Inicial
+# =========================
+load_dotenv()
+st.set_page_config(
+    page_title="OCI Chatbot v3 — Memória, Personas e Feedback", 
+    page_icon="💬", 
+    layout="centered",
+    initial_sidebar_state="expanded"
+)
+
+# Estilos CSS personalizados
+st.markdown("""
+<style>
+    .small { font-size: 0.85rem; color: #666; }
+    .bubble-user { 
+        background: #e1f5fe; 
+        padding: 0.8rem 1rem; 
+        border-radius: 1rem 1rem 0 1rem;
+        margin: 0.5rem 0;
+        border: 1px solid #bbdefb;
+    }
+    .bubble-bot { 
+        background: #f3e5f5; 
+        padding: 0.8rem 1rem; 
+        border-radius: 1rem 1rem 1rem 0;
+        margin: 0.5rem 0;
+        border: 1px solid #e1bee7;
+    }
+    .tag { 
+        display:inline-block; 
+        padding: 4px 10px; 
+        border-radius: 12px; 
+        background:#f1f5f9; 
+        margin-right:8px;
+        font-size: 0.8rem;
+        border: 1px solid #e2e8f0;
+    }
+    .metrics { 
+        background: #f8f9fa; 
+        padding: 1rem; 
+        border-radius: 0.5rem; 
+        margin: 0.5rem 0; 
+        border: 1px solid #e2e8f0;
+    }
+    .stButton button {
+        width: 100%;
+        background-color: #4f46e5;
+        color: white;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# =========================
+# Personas & Estilos
+# =========================
+PERSONAS = {
+    "Professor": "Explique com exemplos simples e analogias, seja didático e paciente.",
+    "Suporte Técnico": "Seja objetivo, passo a passo, com troubleshooting e validações.",
+    "Contador de Histórias": "Use narrativa leve, metáforas curtas e exemplos envolventes.",
+    "Analista": "Forneça dados estruturados, análise objetiva e insights acionáveis."
+}
+
+STYLES = {
+    "Formal": "Escreva em tom profissional, claro e direto, evitando coloquialismos.",
+    "Técnico": "Use termos técnicos quando necessário, inclua listas numeradas e considerações práticas.",
+    "Simples": "Frases curtas, vocabulário simples, vá direto ao ponto.",
+    "Empático": "Seja caloroso, encorajador e demonstre compreensão emocional."
+}
+
+# =========================
+# Modelos de parâmetros
+# =========================
+class GenParams(BaseModel):
+    temperature: float = Field(0.5, ge=0.0, le=1.0)
+    top_p: float = Field(0.9, ge=0.0, le=1.0)
+    max_tokens: int = Field(512, ge=64, le=4096)
+    memory_turns: int = Field(6, ge=0, le=20)
+
+# =========================
+# Cliente OCI (Modo Simulação)
+# =========================
+class OCIClient:
+    def __init__(self, mode: str = "mock"):
+        self.mode = mode
+        self.endpoint = os.getenv("OCI_ENDPOINT_URL", "")
+        self.region = os.getenv("OCI_REGION", "")
+        self.compartment = os.getenv("OCI_COMPARTMENT_OCID", "")
+        
+    def generate(self, messages: List[Dict[str, str]], params: GenParams) -> str:
+        """Gera resposta usando modo simulação (até você ter as credenciais OCI)"""
+        return self._mock_response(messages, params)
+    
+    def _mock_response(self, messages: List[Dict[str, str]], params: GenParams) -> str:
+        """Resposta simulada para desenvolvimento"""
+        user_last = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+        
+        # Identificar persona ativa
+        persona = "Assistente"
+        system_msg = next((m["content"] for m in messages if m["role"] == "system"), "")
+        for k in PERSONAS.keys():
+            if k.lower() in system_msg.lower():
+                persona = k
+                break
+        
+        # Gerar resposta simulada baseada na persona
+        responses = {
+            "Professor": f"Como educador, vou explicar isso passo a passo. Primeiro, é importante entender que '{user_last}' pode ser abordado de várias perspectivas. Vamos começar com os fundamentos...",
+            "Suporte Técnico": f"Para resolver isso, vamos seguir um processo de troubleshooting: 1) Verifique X, 2) Confirme Y, 3) Teste Z. Isso deve resolver o problema relacionado a '{user_last}'.",
+            "Contador de Histórias": f"Isso me lembra uma história... Era uma vez alguém que enfrentou um desafio similar a '{user_last}'. Eles descobriram que a melhor abordagem era...",
+            "Analista": f"Analisando sua pergunta sobre '{user_last}', os dados mostram que 72% dos casos similares são resolvidos com a abordagem A, 23% com B, e 5% requerem intervenção especializada.",
+            "Assistente": f"Entendi sua pergunta sobre '{user_last}'. Posso ajudar com informações detalhadas, exemplos práticos e orientações passo a passo."
+        }
+        
+        response = responses.get(persona, responses["Assistente"])
+        return f"{response}\n\n*(Modo simulação - {persona} | temp={params.temperature})*"
+
+# =========================
+# Helpers: prompt & memória
+# =========================
+def build_system_prompt(persona: str, style: str) -> str:
+    guardrails = (
+        "Responda em PT-BR. Seja útil, claro e honesto sobre limitações. "
+        "Quando for apropriado, proponha próximos passos práticos. "
+        "Se a pergunta for ambígua, peça uma única clarificação curta. "
+        "Nunca invente números ou políticas internas."
+    )
+    return f"""Você é um assistente especializado com foco em {persona}. 
+Persona: {PERSONAS[persona]}
+Estilo: {style}. {STYLES[style]}
+Regras: {guardrails}"""
+
+def trim_history(history: List[Dict[str, str]], max_turns: int) -> List[Dict[str, str]]:
+    """Mantém apenas as últimas N trocas além da mensagem de sistema."""
+    system = [m for m in history if m["role"] == "system"]
+    dialog = [m for m in history if m["role"] in ("user", "assistant")]
+    if max_turns <= 0:
+        return system
+    return system + dialog[-(max_turns*2):]
+
+# =========================
+# Sistema de Banco de Dados
+# =========================
+def init_db():
+    """Inicializa o banco de dados SQLite"""
+    conn = sqlite3.connect('feedback.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            persona TEXT,
+            style TEXT,
+            rating TEXT,
+            comment TEXT,
+            user_msg TEXT,
+            assistant_msg TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def save_feedback_db(feedback_data: Dict[str, Any]):
+    """Salva feedback no SQLite"""
+    conn = sqlite3.connect('feedback.db')
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO feedback (timestamp, persona, style, rating, comment, user_msg, assistant_msg)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        feedback_data.get("timestamp"),
+        feedback_data.get("persona"),
+        feedback_data.get("style"),
+        feedback_data.get("rating"),
+        feedback_data.get("comment"),
+        feedback_data.get("user_msg"),
+        feedback_data.get("assistant_msg")
+    ))
+    conn.commit()
+    conn.close()
+
+def get_feedback_data():
+    """Recupera todos os dados de feedback"""
+    conn = sqlite3.connect('feedback.db')
+    df = pd.read_sql_query("SELECT * FROM feedback", conn)
+    conn.close()
+    return df
+
+# =========================
+# Páginas do Streamlit
+# =========================
+def main_chat_page():
+    """Página principal do chat"""
+    st.sidebar.title("⚙️ Configurações")
+    
+    # Configurações de Persona e Estilo
+    persona = st.sidebar.selectbox("Persona", list(PERSONAS.keys()), index=0)
+    style = st.sidebar.selectbox("Estilo", list(STYLES.keys()), index=0)
+    
+    st.sidebar.markdown("---")
+    st.sidebar.caption("Parâmetros do Modelo")
+    temperature = st.sidebar.slider("Temperature", 0.0, 1.0, 0.7, 0.05, 
+                                   help="Controla a criatividade: valores mais baixos = mais determinístico")
+    top_p = st.sidebar.slider("Top-P", 0.0, 1.0, 0.9, 0.05, 
+                             help="Controla diversidade: valores mais baixos = mais focado")
+    max_tokens = st.sidebar.slider("Max tokens", 64, 2048, 512, 32,
+                                  help="Número máximo de tokens na resposta")
+    memory_turns = st.sidebar.slider("Memória (nº de trocas)", 0, 20, 6, 1,
+                                    help="Quantas interações anteriores lembrar")
+
+    st.sidebar.markdown("---")
+    mock_mode = st.sidebar.toggle("Modo Simulação (Ativo sem credenciais OCI)", value=True)
+    st.sidebar.info("✅ Modo simulação ativo. Desative quando tiver as credenciais OCI.")
+
+    # Inicializar cliente e parâmetros
+    params = GenParams(temperature=temperature, top_p=top_p, max_tokens=max_tokens, memory_turns=memory_turns)
+    client = OCIClient(mode="mock" if mock_mode else "oci")
+
+    # UI - Cabeçalho
+    st.title("💬 Chatbot OCI v3")
+    st.caption("Sistema de conversação com memória, personas e feedback - Pronto para integração com Oracle Cloud")
+    
+    # Tags de configuração
+    st.markdown(
+        f'<span class="tag">🧑‍💼 {persona}</span>'
+        f'<span class="tag">🎨 {style}</span>'
+        f'<span class="tag">🌡️ {temperature}</span>'
+        f'<span class="tag">📊 top-p={top_p}</span>'
+        f'<span class="tag">🧠 mem={memory_turns}</span>',
+        unsafe_allow_html=True
+    )
+
+    # Inicializar estado da sessão
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    
+    if "feedback_submitted" not in st.session_state:
+        st.session_state.feedback_submitted = False
+    
+    # Sistema prompt inicial
+    system_prompt = {"role": "system", "content": build_system_prompt(persona, style)}
+    
+    # Atualizar system prompt se persona/estilo mudou
+    if not st.session_state.chat_history or st.session_state.chat_history[0]["role"] != "system":
+        st.session_state.chat_history = [system_prompt]
+    else:
+        st.session_state.chat_history[0] = system_prompt
+
+    # Botão para limpar histórico
+    if st.button("🗑️ Limpar Conversa", use_container_width=True):
+        st.session_state.chat_history = [system_prompt]
+        st.session_state.feedback_submitted = False
+        st.rerun()
+
+    # Renderizar histórico de conversa
+    for m in st.session_state.chat_history:
+        if m["role"] == "user":
+            with st.chat_message("user", avatar="🧑‍💻"):
+                st.markdown(f'<div class="bubble-user">{m["content"]}</div>', unsafe_allow_html=True)
+        elif m["role"] == "assistant":
+            with st.chat_message("assistant", avatar="🤖"):
+                st.markdown(f'<div class="bubble-bot">{m["content"]}</div>', unsafe_allow_html=True)
+
+    # Entrada do usuário
+    user_msg = st.chat_input("Digite sua mensagem...")
+    if user_msg:
+        # Adicionar mensagem do usuário ao histórico
+        st.session_state.chat_history.append({"role": "user", "content": user_msg})
+        
+        # Recortar memória para manter apenas as últimas N trocas
+        messages = trim_history(st.session_state.chat_history, params.memory_turns)
+        
+        # Gerar resposta
+        try:
+            with st.spinner("💭 Processando sua pergunta..."):
+                assistant_text = client.generate(messages, params)
+                # Pequena pausa para melhor experiência do usuário
+                time.sleep(0.5)
+            
+            # Adicionar resposta ao histórico
+            st.session_state.chat_history.append({"role": "assistant", "content": assistant_text})
+            st.session_state.feedback_submitted = False
+            st.rerun()
+            
+        except Exception as e:
+            st.error(f"⚠️ Erro ao gerar resposta: {e}")
+
+    # Sistema de feedback para a última resposta
+    if (len(st.session_state.chat_history) > 2 and 
+        st.session_state.chat_history[-1]["role"] == "assistant" and
+        not st.session_state.feedback_submitted):
+        
+        last_user = st.session_state.chat_history[-2]["content"]
+        last_bot = st.session_state.chat_history[-1]["content"]
+        
+        st.markdown("---")
+        st.markdown("### 💡 Feedback desta resposta")
+        
+        cols = st.columns([1, 3])
+        with cols[0]:
+            rating = st.radio("Avaliação", ["👍", "👎"], horizontal=True, 
+                             index=0, label_visibility="collapsed")
+        with cols[1]:
+            comment = st.text_input("Comentário (opcional):", 
+                                   placeholder="Como podemos melhorar?")
+        
+        if st.button("Enviar Feedback", use_container_width=True):
+            save_feedback_db({
+                "timestamp": datetime.now().isoformat(),
+                "persona": persona,
+                "style": style,
+                "rating": rating,
+                "comment": comment.strip(),
+                "user_msg": last_user,
+                "assistant_msg": last_bot
+            })
+            st.session_state.feedback_submitted = True
+            st.success("✅ Feedback registrado. Obrigado!")
+            st.rerun()
+
+def analytics_page():
+    """Página de analytics com visualizações dos feedbacks"""
+    st.title("📊 Analytics - Feedback do Chatbot")
+    
+    try:
+        df = get_feedback_data()
+        
+        if df.empty:
+            st.info("📝 Ainda não há dados de feedback coletados.")
+            st.markdown("### 🚀 Como usar:")
+            st.markdown("1. Vá para a página de Chat")
+            st.markdown("2. Faça algumas perguntas ao chatbot")
+            st.markdown("3. Avalie as respostas com 👍 ou 👎")
+            st.markdown("4. Volte aqui para ver as análises!")
+            return
+            
+        # Converter timestamp para datetime
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df['date'] = df['timestamp'].dt.date
+        
+        # Métricas gerais
+        total_feedbacks = len(df)
+        positive_feedbacks = len(df[df['rating'] == '👍'])
+        negative_feedbacks = len(df[df['rating'] == '👎'])
+        satisfaction_rate = (positive_feedbacks / total_feedbacks * 100) if total_feedbacks > 0 else 0
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Feedbacks", total_feedbacks)
+        col2.metric("👍 Positivos", positive_feedbacks)
+        col3.metric("👎 Negativos", negative_feedbacks)
+        col4.metric("Taxa de Satisfação", f"{satisfaction_rate:.1f}%")
+        
+        st.markdown("---")
+        
+        # Gráficos
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Distribuição por Persona")
+            persona_counts = df['persona'].value_counts()
+            fig_persona = px.pie(
+                values=persona_counts.values, 
+                names=persona_counts.index,
+                color_discrete_sequence=px.colors.sequential.Plasma
+            )
+            st.plotly_chart(fig_persona, use_container_width=True)
+            
+        with col2:
+            st.subheader("Avaliação por Persona")
+            rating_by_persona = pd.crosstab(df['persona'], df['rating'])
+            fig_rating_persona = px.bar(
+                rating_by_persona, 
+                barmode='group',
+                color_discrete_sequence=['#ff4b4b', '#4bb543']
+            )
+            st.plotly_chart(fig_rating_persona, use_container_width=True)
+        
+        # Comentários
+        st.subheader("📝 Comentários dos Usuários")
+        comments_df = df[df['comment'].notna() & (df['comment'] != '')][['timestamp', 'persona', 'rating', 'comment']]
+        
+        if not comments_df.empty:
+            for _, row in comments_df.iterrows():
+                with st.expander(f"{row['timestamp']} - {row['persona']} - {row['rating']}"):
+                    st.write(row['comment'])
+        else:
+            st.info("Nenhum comentário foi registrado ainda.")
+            
+    except Exception as e:
+        st.error(f"Erro ao carregar dados: {e}")
+
+# =========================
+# App principal
+# =========================
+def main():
+    # Inicializar banco de dados
+    init_db()
+    
+    # Navegação entre páginas
+    st.sidebar.title("Navegação")
+    page = st.sidebar.radio("Selecione a página:", ["💬 Chat", "📊 Analytics"])
+    
+    # Informações da OCI na sidebar
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🔧 Configuração OCI")
+    st.sidebar.info("Para conectar com OCI, configure as variáveis de ambiente:\n- OCI_ENDPOINT_URL\n- OCI_REGION\n- OCI_COMPARTMENT_OCID")
+    
+    # Executar página selecionada
+    if page == "💬 Chat":
+        main_chat_page()
+    elif page == "📊 Analytics":
+        analytics_page()
+
+if __name__ == "__main__":
+    main()
